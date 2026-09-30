@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TXG 5-Site Ramp Tester</title>
+<style>
+body{margin:0;font-family:Arial,sans-serif;background:#0b0f14;color:#fff;padding:20px}
+.box{max-width:900px;margin:auto;background:#121821;padding:20px;border-radius:16px}
+h2{margin-top:0}
+input{width:100%;box-sizing:border-box;padding:12px;margin:6px 0;border:1px solid #303b49;border-radius:8px;background:#0d131b;color:white}
+button{padding:12px 18px;border:0;border-radius:9px;cursor:pointer;margin:6px 4px 6px 0;font-weight:bold}
+.start{background:#20c997;color:#06100c}.stop{background:#e74c3c;color:white}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:15px}
+.card{background:#0d131b;padding:14px;border-radius:10px}
+.small{color:#9da9b7;font-size:13px}.value{font-size:20px;font-weight:bold;margin-top:5px}
+#status{margin-top:15px;padding:12px;border-radius:9px;background:#0d131b}
+.site{margin-top:12px;padding:12px;background:#0d131b;border-radius:10px}
+.ok{color:#35d07f}.bad{color:#ff6b6b}
+</style>
+</head>
+<body>
+<div class="box">
+<h2>TXG 5-Site Ramp Tester</h2>
+<p class="small">Use only with servers/endpoints you own or are authorized to test.</p>
+
+<input id="url1" placeholder="Website 1 URL">
+<input id="url2" placeholder="Website 2 URL">
+<input id="url3" placeholder="Website 3 URL">
+<input id="url4" placeholder="Website 4 URL">
+<input id="url5" placeholder="Website 5 URL">
+
+<input id="duration" type="number" min="1" max="300" value="30" placeholder="Duration">
+
+<button class="start" onclick="startTest()">START TEST</button>
+<button class="stop" onclick="stopTest()">STOP</button>
+
+<div id="status">Ready</div>
+
+<div class="grid">
+<div class="card"><div class="small">Current RPS / site</div><div class="value" id="rps">0</div></div>
+<div class="card"><div class="small">Total RPS</div><div class="value" id="totalRps">0</div></div>
+<div class="card"><div class="small">Requests</div><div class="value" id="requests">0</div></div>
+<div class="card"><div class="small">Successful</div><div class="value" id="success">0</div></div>
+<div class="card"><div class="small">Failed</div><div class="value" id="failed">0</div></div>
+<div class="card"><div class="small">Avg latency</div><div class="value" id="latency">0 ms</div></div>
+</div>
+
+<div id="siteResults"></div>
+</div>
+
+<script>
+const MAX_TOTAL_RPS=2500;
+let running=false,stopRequested=false,stats=[];
+
+function setStatus(t){document.getElementById("status").textContent=t}
+function getURLs(){
+ return [1,2,3,4,5].map(i=>document.getElementById("url"+i).value.trim()).filter(Boolean);
+}
+function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
+
+async function requestSite(site){
+ const started=performance.now();
+ try{
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),10000);
+  const response=await fetch(site.url,{method:"GET",cache:"no-store",mode:"cors",signal:controller.signal});
+  clearTimeout(timer);
+  const ms=Math.round(performance.now()-started);
+  site.requests++;site.latencies.push(ms);
+  if(response.ok){site.success++;return {ok:true,latency:ms}}
+  site.failed++;
+  const reason="HTTP "+response.status+(response.statusText?" "+response.statusText:"");
+  site.errors[reason]=(site.errors[reason]||0)+1;
+  return {ok:false,latency:ms,reason};
+ }catch(error){
+  const ms=Math.round(performance.now()-started);
+  site.requests++;site.failed++;site.latencies.push(ms);
+  let reason=error.name==="AbortError"?"Timeout (>10 seconds)":(error.message||"Network error");
+  site.errors[reason]=(site.errors[reason]||0)+1;
+  return {ok:false,latency:ms,reason};
+ }
+}
+
+function render(){
+ let totalRequests=0,totalSuccess=0,totalFailed=0,allLatencies=[];
+ stats.forEach(s=>{
+  totalRequests+=s.requests;totalSuccess+=s.success;totalFailed+=s.failed;
+  allLatencies=allLatencies.concat(s.latencies);
+ });
+ document.getElementById("requests").textContent=totalRequests;
+ document.getElementById("success").textContent=totalSuccess;
+ document.getElementById("failed").textContent=totalFailed;
+ const avg=allLatencies.length?Math.round(allLatencies.reduce((a,b)=>a+b,0)/allLatencies.length):0;
+ document.getElementById("latency").textContent=avg+" ms";
+
+ let html="";
+ stats.forEach((s,i)=>{
+  const siteAvg=s.latencies.length?Math.round(s.latencies.reduce((a,b)=>a+b,0)/s.latencies.length):0;
+  let errors="";
+  Object.keys(s.errors).forEach(r=>errors+="<div class='bad'>"+escapeHTML(r)+" × "+s.errors[r]+"</div>");
+  html+=`<div class="site"><b>Site ${i+1}</b><br><span class="small">${escapeHTML(s.url)}</span>
+  <div>Requests: ${s.requests} | <span class="ok">Success: ${s.success}</span> | <span class="bad">Failed: ${s.failed}</span></div>
+  <div>Average latency: ${siteAvg} ms</div>
+  <br><b>Failure reasons:</b><br>${errors||"<span class='ok'>No failures</span>"}</div>`;
+ });
+ document.getElementById("siteResults").innerHTML=html;
+}
+
+function escapeHTML(x){
+ return x.replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
+}
+
+async function runForSecond(rps){
+ const count=Math.min(rps,Math.floor(MAX_TOTAL_RPS/stats.length));
+ const promises=[];
+ const delay=1000/rps;
+ for(const site of stats){
+  for(let i=0;i<count && !stopRequested;i++){
+   promises.push(requestSite(site));
+   await sleep(delay);
+  }
+ }
+ await Promise.allSettled(promises);
+}
+
+async function startTest(){
+ if(running)return;
+ const urls=getURLs();
+ if(!urls.length){alert("Enter at least one authorized URL.");return}
+ const duration=Math.min(300,Math.max(1,Number(document.getElementById("duration").value)||30));
+ running=true;stopRequested=false;
+ stats=urls.map(url=>({url,requests:0,success:0,failed:0,latencies:[],errors:{}}));
+ const ramp=[100,250,500,750,1000];
+ setStatus("Testing started...");
+ let second=0;
+
+ while(!stopRequested && second<duration){
+  const requested=ramp[Math.min(second,ramp.length-1)];
+  const safePerSite=Math.min(requested,Math.floor(MAX_TOTAL_RPS/stats.length));
+  const total=safePerSite*stats.length;
+  document.getElementById("rps").textContent=safePerSite;
+  document.getElementById("totalRps").textContent=total;
+  setStatus("Testing — "+safePerSite+" RPS/site ("+total+" total)");
+  await runForSecond(safePerSite);
+  render();
+
+  const tr=stats.reduce((a,s)=>a+s.requests,0);
+  const tf=stats.reduce((a,s)=>a+s.failed,0);
+  if(tr>=100 && tf/tr>=0.50){
+   stopRequested=true;
+   setStatus("AUTO STOP — failure rate reached 50%");
+   break;
+  }
+  second++;
+ }
+ running=false;render();
+ if(stopRequested && !document.getElementById("status").textContent.startsWith("AUTO STOP"))
+  setStatus("Stopped by user.");
+ else if(!document.getElementById("status").textContent.startsWith("AUTO STOP"))
+  setStatus("Completed — final results shown below.");
+}
+
+function stopTest(){
+ if(!running)return;
+ stopRequested=true;
+ setStatus("Stopping safely...");
+}
+</script>
+</body>
+</html>
